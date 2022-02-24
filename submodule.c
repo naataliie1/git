@@ -811,6 +811,16 @@ static const char *default_name_or_path(const char *path_or_name)
  * member of the changed submodule string_list_item.
  */
 struct changed_submodule_data {
+	/*
+	 * The first superproject commit in the rev walk that points to the
+	 * submodule.
+	 */
+	const struct object_id *super_oid;
+	/*
+	 * Path to the submodule in the superproject commit referenced
+	 * by 'super_oid'.
+	 */
+	char *path;
 	/* The submodule commits that have changed in the rev walk. */
 	struct oid_array new_commits;
 };
@@ -818,6 +828,7 @@ struct changed_submodule_data {
 static void changed_submodule_data_clear(struct changed_submodule_data *cs_data)
 {
 	oid_array_clear(&cs_data->new_commits);
+	free(cs_data->path);
 }
 
 static void collect_changed_submodules_cb(struct diff_queue_struct *q,
@@ -865,6 +876,8 @@ static void collect_changed_submodules_cb(struct diff_queue_struct *q,
 		if (!item->util)
 			item->util = xcalloc(1, sizeof(struct changed_submodule_data));
 		cs_data = item->util;
+		cs_data->super_oid = commit_oid;
+		cs_data->path = xstrdup(p->two->path);
 		oid_array_append(&cs_data->new_commits, &p->two->oid);
 	}
 }
@@ -1253,14 +1266,33 @@ void check_for_new_submodule_commits(struct object_id *oid)
 	oid_array_append(&ref_tips_after_fetch, oid);
 }
 
+/*
+ * Returns 1 if there is at least one submodule gitdir in
+ * $GIT_DIR/modules and 0 otherwise. This follows
+ * submodule_name_to_gitdir(), which looks for submodules in
+ * $GIT_DIR/modules, not $GIT_COMMON_DIR.
+ *
+ * A submodule can be moved to $GIT_DIR/modules manually by running "git
+ * submodule absorbgitdirs", or it may be initialized there by "git
+ * submodule update".
+ */
+static int repo_has_absorbed_submodules(struct repository *r)
+{
+	struct strbuf buf = STRBUF_INIT;
+
+	strbuf_repo_git_path(&buf, r, "modules/");
+	return file_exists(buf.buf) && !is_empty_dir(buf.buf);
+}
+
 static void calculate_changed_submodule_paths(struct repository *r,
 		struct string_list *changed_submodule_names)
 {
 	struct strvec argv = STRVEC_INIT;
 	struct string_list_item *name;
 
-	/* No need to check if there are no submodules configured */
-	if (!submodule_from_path(r, NULL, NULL))
+	/* No need to check if no submodules would be fetched */
+	if (!submodule_from_path(r, NULL, NULL) &&
+	    !repo_has_absorbed_submodules(r))
 		return;
 
 	strvec_push(&argv, "--"); /* argv[0] program name */
@@ -1333,7 +1365,8 @@ int submodule_touches_in_range(struct repository *r,
 }
 
 struct submodule_parallel_fetch {
-	int count;
+	int index_count;
+	int changed_count;
 	struct strvec args;
 	struct repository *r;
 	const char *prefix;
@@ -1343,6 +1376,7 @@ struct submodule_parallel_fetch {
 	int result;
 
 	struct string_list changed_submodule_names;
+	struct string_list seen_submodule_names;
 
 	/* Pending fetches by OIDs */
 	struct fetch_task **oid_fetch_tasks;
@@ -1353,6 +1387,7 @@ struct submodule_parallel_fetch {
 #define SPF_INIT { \
 	.args = STRVEC_INIT, \
 	.changed_submodule_names = STRING_LIST_INIT_DUP, \
+	.seen_submodule_names = STRING_LIST_INIT_DUP, \
 	.submodules_with_errors = STRBUF_INIT, \
 }
 
@@ -1390,6 +1425,7 @@ struct fetch_task {
 	const struct submodule *sub;
 	unsigned free_sub : 1; /* Do we need to free the submodule? */
 	const char *default_argv;
+	struct strvec git_args;
 
 	struct oid_array *commits; /* Ensure these commits are fetched */
 };
@@ -1425,6 +1461,8 @@ static void fetch_task_release(struct fetch_task *p)
 	if (p->repo)
 		repo_clear(p->repo);
 	FREE_AND_NULL(p->repo);
+
+	strvec_clear(&p->git_args);
 }
 
 static struct repository *get_submodule_repo_for(struct repository *r,
@@ -1463,6 +1501,9 @@ static struct fetch_task *fetch_task_create(struct submodule_parallel_fetch *spf
 		task->free_sub = 1;
 	}
 
+	if (string_list_lookup(&spf->seen_submodule_names, task->sub->name))
+		goto cleanup;
+
 	switch (get_fetch_recurse_config(task->sub, spf))
 	{
 	default:
@@ -1493,10 +1534,12 @@ static struct fetch_task *fetch_task_create(struct submodule_parallel_fetch *spf
 }
 
 static struct fetch_task *
-get_fetch_task(struct submodule_parallel_fetch *spf, struct strbuf *err)
+get_fetch_task_from_index(struct submodule_parallel_fetch *spf,
+			  struct strbuf *err)
 {
-	for (; spf->count < spf->r->index->cache_nr; spf->count++) {
-		const struct cache_entry *ce = spf->r->index->cache[spf->count];
+	for (; spf->index_count < spf->r->index->cache_nr; spf->index_count++) {
+		const struct cache_entry *ce =
+			spf->r->index->cache[spf->index_count];
 		struct fetch_task *task;
 
 		if (!S_ISGITLINK(ce->ce_mode))
@@ -1511,7 +1554,7 @@ get_fetch_task(struct submodule_parallel_fetch *spf, struct strbuf *err)
 				strbuf_addf(err, _("Fetching submodule %s%s\n"),
 					    spf->prefix, ce->name);
 
-			spf->count++;
+			spf->index_count++;
 			return task;
 		} else {
 			struct strbuf empty_submodule_path = STRBUF_INIT;
@@ -1539,11 +1582,64 @@ get_fetch_task(struct submodule_parallel_fetch *spf, struct strbuf *err)
 	return NULL;
 }
 
+static struct fetch_task *
+get_fetch_task_from_changed(struct submodule_parallel_fetch *spf,
+			    struct strbuf *err)
+{
+	for (; spf->changed_count < spf->changed_submodule_names.nr;
+	     spf->changed_count++) {
+		struct string_list_item item =
+			spf->changed_submodule_names.items[spf->changed_count];
+		struct changed_submodule_data *cs_data = item.util;
+		struct fetch_task *task;
+
+		if (!is_tree_submodule_active(spf->r, cs_data->super_oid,cs_data->path))
+			continue;
+
+		task = fetch_task_create(spf, cs_data->path,
+					 cs_data->super_oid);
+		if (!task)
+			continue;
+
+		if (!task->repo) {
+			strbuf_addf(err, _("Could not access submodule '%s' at commit %s\n"),
+				    cs_data->path,
+				    find_unique_abbrev(cs_data->super_oid, DEFAULT_ABBREV));
+
+			fetch_task_release(task);
+			free(task);
+			continue;
+		}
+
+		if (!spf->quiet)
+			strbuf_addf(err,
+				    _("Fetching submodule %s%s at commit %s\n"),
+				    spf->prefix, task->sub->path,
+				    find_unique_abbrev(cs_data->super_oid,
+						       DEFAULT_ABBREV));
+
+		spf->changed_count++;
+		/*
+		 * NEEDSWORK: A submodule unpopulated by "git rm" will
+		 * have core.worktree set, but the actual core.worktree
+		 * directory won't exist, causing the child process to
+		 * fail. Forcibly set --work-tree until we get smarter
+		 * handling for core.worktree in unpopulated submodules.
+		 */
+		strvec_push(&task->git_args, "--work-tree=.");
+		return task;
+	}
+	return NULL;
+}
+
 static int get_next_submodule(struct child_process *cp, struct strbuf *err,
 			      void *data, void **task_cb)
 {
 	struct submodule_parallel_fetch *spf = data;
-	struct fetch_task *task = get_fetch_task(spf, err);
+	struct fetch_task *task =
+		get_fetch_task_from_index(spf, err);
+	if (!task)
+		task = get_fetch_task_from_changed(spf, err);
 
 	if (task) {
 		struct strbuf submodule_prefix = STRBUF_INIT;
@@ -1553,6 +1649,8 @@ static int get_next_submodule(struct child_process *cp, struct strbuf *err,
 		prepare_submodule_repo_env_in_gitdir(&cp->env_array);
 		cp->git_cmd = 1;
 		strvec_init(&cp->args);
+		if (task->git_args.nr)
+			strvec_pushv(&cp->args, task->git_args.v);
 		strvec_pushv(&cp->args, spf->args.v);
 		strvec_push(&cp->args, task->default_argv);
 		strvec_push(&cp->args, "--submodule-prefix");
@@ -1564,6 +1662,7 @@ static int get_next_submodule(struct child_process *cp, struct strbuf *err,
 		*task_cb = task;
 
 		strbuf_release(&submodule_prefix);
+		string_list_insert(&spf->seen_submodule_names, task->sub->name);
 		return 1;
 	}
 
@@ -1678,11 +1777,11 @@ out:
 	return 0;
 }
 
-int fetch_populated_submodules(struct repository *r,
-			       const struct strvec *options,
-			       const char *prefix, int command_line_option,
-			       int default_option,
-			       int quiet, int max_parallel_jobs)
+int fetch_submodules(struct repository *r,
+		     const struct strvec *options,
+		     const char *prefix, int command_line_option,
+		     int default_option,
+		     int quiet, int max_parallel_jobs)
 {
 	int i;
 	struct submodule_parallel_fetch spf = SPF_INIT;
