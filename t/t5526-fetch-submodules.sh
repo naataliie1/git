@@ -93,7 +93,7 @@ add_superproject_commits() {
 #
 # If a repo should not be fetched in the test, its corresponding
 # expect.err file should be rm-ed.
-verify_fetch_result() {
+verify_fetch_result () {
 	ACTUAL_ERR=$1 &&
 	rm -f expect.err.combined &&
 	if [ -f expect.err.super ]; then
@@ -105,7 +105,7 @@ verify_fetch_result() {
 	if [ -f expect.err.deep ]; then
 		cat expect.err.deep >>expect.err.combined
 	fi &&
-	sed -E 's/[0-9a-f]+\.\./OLD_HEAD\.\./' $ACTUAL_ERR >actual.err.cmp &&
+	sed -e 's/[0-9a-f][0-9a-f]*\.\./OLD_HEAD\.\./' "$ACTUAL_ERR" >actual.err.cmp &&
 	test_cmp expect.err.combined actual.err.cmp
 }
 
@@ -562,7 +562,7 @@ test_expect_success "'--recurse-submodules' should fetch submodule commits in ch
 	From $pwd/submodule2
 	   OLD_HEAD..$sub2_head  sub2       -> origin/sub2
 	EOF
-	sed -E "s/[0-9a-f]+\.\./OLD_HEAD\.\./" actual.err >actual.err.cmp &&
+	sed -e "s/[0-9a-f][0-9a-f]*\.\./OLD_HEAD\.\./" actual.err >actual.err.cmp &&
 	test_cmp expect.err.combined actual.err.cmp
 '
 
